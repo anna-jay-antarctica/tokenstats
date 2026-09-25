@@ -1,8 +1,11 @@
 ﻿{
     "name":  "opencode-tokenstat",
-    "version":  "0.1.0",
+    "version":  "0.1.2",
     "description":  "Shows cumulative input/output tokens and cache hit rate in the OpenCode TUI.",
     "type":  "module",
+    "scripts":  {
+                    "dev:copy":  "node scripts/copy-local.mjs"
+                },
     "exports":  {
                     ".":  "./index.ts",
                     "./tui":  "./tui.tsx"

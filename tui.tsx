@@ -1,11 +1,37 @@
+/** @jsxImportSource @opentui/solid */
 import { Plugin } from "@opencode/plugin/tui"
+import { createEffect, createSignal, on, onCleanup } from "solid-js"
 
 function formatTokens(value: number) {
   return Math.round(value).toLocaleString()
 }
 
 function TokenStatus(props: { context: any; sessionID?: string }) {
+  const [revision, refresh] = createSignal(0)
+
+  createEffect(on(() => props.sessionID, (sessionID) => {
+    if (!sessionID) return
+
+    let active = true
+    const stop = props.context.data.on("session.execution.succeeded", (event: { data: { sessionID: string } }) => {
+      if (event.data.sessionID !== sessionID) return
+
+      props.context.data.session.invalidate(sessionID)
+      void props.context.data.session.sync(sessionID)
+        .then(() => {
+          if (active) refresh((value) => value + 1)
+        })
+        .catch(console.error)
+    })
+
+    onCleanup(() => {
+      active = false
+      stop()
+    })
+  }))
+
   const label = () => {
+    revision()
     if (!props.sessionID) return "IN — · OUT — · CACHE —"
 
     const tokens = props.context.data.session.get(props.sessionID)?.tokens

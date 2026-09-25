@@ -1,6 +1,4 @@
-﻿import { Plugin } from "@opencode/plugin"
-
-export default Plugin.define({
+﻿export default {
   id: "opencodelog.tokenstat",
   setup() {},
-})
+}

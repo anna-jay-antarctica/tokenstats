@@ -1,5 +1,7 @@
 node_modules/
+.opencode/
 *.tgz
 npm-debug.log*
 .DS_Store
 Thumbs.db
+/.vs

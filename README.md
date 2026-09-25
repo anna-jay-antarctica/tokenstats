@@ -10,39 +10,24 @@ IN 12,345 · OUT 1,234 · CACHE 82%
 
 The OpenCode TUI plugin API does not expose a slot inside the built-in agent/model/provider label, so tokenstat uses `prompt.footer.status` beside the composer.
 
-## Install
+![tokenstat in the OpenCode prompt footer](https://raw.githubusercontent.com/anna-jay-antarctica/tokenstats/main/docs/screenshot.png)
 
-Once published to npm:
+## Install
 
 ```sh
 opencode plugin add opencode-tokenstat
 ```
 
-To pin a release, use `opencode plugin add opencode-tokenstat@0.1.0`.
+To pin a release, use `opencode plugin add opencode-tokenstat@0.1.2` after publishing that version.
 
-## Test locally
+## Local development
 
-1. From the project where you want to test, add the absolute plugin directory to `opencode.jsonc`:
-
-   ```jsonc
-   {
-     "plugins": ["D:/dev/tokenstats"]
-   }
-   ```
-
-   Preserve any existing configuration and append the path to its `plugins` array.
-2. Restart OpenCode (or restart its service) so it reloads plugin configuration.
-3. Open a session and send a prompt. The footer should show `IN`, `OUT`, and `CACHE`; the counts update as the provider reports usage.
-4. Check startup output if the footer is absent. Ensure the installed OpenCode version supports the current TUI plugin API.
-
-## Publish
-
-Create a public GitHub repository for this project and add its URL to the `repository` field in `package.json`. The package already includes an Apache-2.0 license. Verify the package contents before publishing:
+From this repository, copy the plugin into the project-local discovery directory:
 
 ```sh
-npm login
-npm pack --dry-run
-npm publish --access public
+npm run dev:copy
 ```
 
-For later releases, update `version` in `package.json` (for example `npm version patch`) and publish again. The npm package name `opencode-tokenstat` must be available (or owned by your npm account) before the first release.
+OpenCode discovers `.opencode/plugins/tokenstat/` automatically. The no-op server entrypoint does not need `@opencode/plugin` at runtime; the TUI entrypoint imports `@opencode/plugin/tui`, which OpenCode resolves for local CLI plugins. For local type checking, install dependencies with `npm install`. Run `npm run dev:copy` again after editing the plugin files; if the TUI does not reload the plugin automatically, restart OpenCode. The `.opencode/` directory is git-ignored.
+
+The plugin appears in both server and TUI plugin views by design: `index.ts` is a no-op server entrypoint needed for automatic TUI loading, while `tui.tsx` renders the token counter. These are two entrypoints of the same local package, not two copies of the UI.
