@@ -1,0 +1,35 @@
+﻿{
+    "name":  "opencode-tokenstat",
+    "version":  "0.1.0",
+    "description":  "Shows cumulative input/output tokens and cache hit rate in the OpenCode TUI.",
+    "type":  "module",
+    "exports":  {
+                    ".":  "./index.ts",
+                    "./tui":  "./tui.tsx"
+                },
+    "files":  [
+                  "index.ts",
+                  "tui.tsx",
+                  "README.md",
+                  "LICENSE"
+              ],
+    "dependencies":  {
+                         "@opencode/plugin":  "latest"
+                     },
+    "peerDependencies":  {
+                             "@opentui/core":  "\u003e=0.5.8",
+                             "@opentui/solid":  "\u003e=0.5.8",
+                             "solid-js":  "\u003e=1.9.0"
+                         },
+    "keywords":  [
+                     "opencode",
+                     "opencode-plugin",
+                     "tui",
+                     "tokens",
+                     "usage"
+                 ],
+    "engines":  {
+                    "node":  "\u003e=20"
+                },
+    "license":  "Apache-2.0"
+}
