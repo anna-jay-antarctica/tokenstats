@@ -3,10 +3,10 @@
 OpenCode TUI plugin that displays cumulative token usage for the active session in the prompt footer:
 
 ```text
-IN 12,345 · OUT 1,234 · CACHE 82%
+IN 12,345 · OUT 1,234 · CH 82%
 ```
 
-`IN` includes input, cache reads, and cache writes. `OUT` includes generated output and reasoning tokens. Cache hit is cache-read tokens divided by all input and cache tokens. Values depend on usage reported by the provider.
+The counter stays hidden until the current session has token usage. `IN` includes input, cache reads, and cache writes. `OUT` includes generated output and reasoning tokens. `CH` (cache hit) is cache-read tokens divided by all input and cache tokens. Values depend on usage reported by the provider.
 
 The OpenCode TUI plugin API does not expose a slot inside the built-in agent/model/provider label, so tokenstat uses `prompt.footer.status` beside the composer.
 

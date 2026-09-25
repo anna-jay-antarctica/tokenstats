@@ -32,19 +32,21 @@ function TokenStatus(props: { context: any; sessionID?: string }) {
 
   const label = () => {
     revision()
-    if (!props.sessionID) return "IN — · OUT — · CACHE —"
+    if (!props.sessionID) return
 
     const tokens = props.context.data.session.get(props.sessionID)?.tokens
-    if (!tokens) return "IN 0 · OUT 0 · CACHE —"
+    if (!tokens) return
 
     const input = tokens.input ?? 0
     const output = (tokens.output ?? 0) + (tokens.reasoning ?? 0)
     const cacheRead = tokens.cache?.read ?? 0
     const cacheWrite = tokens.cache?.write ?? 0
     const totalInput = input + cacheRead + cacheWrite
+    if (totalInput + output === 0) return
+
     const cacheHit = totalInput > 0 ? `${Math.round((cacheRead / totalInput) * 100)}%` : "—"
 
-    return `IN ${formatTokens(totalInput)} · OUT ${formatTokens(output)} · CACHE ${cacheHit}`
+    return `IN ${formatTokens(totalInput)} · OUT ${formatTokens(output)} · CH ${cacheHit}`
   }
 
   return <text fg={props.context.theme.text.base}>{label()}</text>
