@@ -1,9 +1,322 @@
 /** @jsxImportSource @opentui/solid */
 import { Plugin } from "@opencode/plugin/tui"
-import { createEffect, createSignal, on, onCleanup } from "solid-js"
+import type { MouseEvent } from "@opentui/core"
+import { useTerminalDimensions } from "@opentui/solid"
+import { createEffect, createMemo, createSignal, For, on, onCleanup, Show } from "solid-js"
+
+type Scope = "project" | "all"
+type Period = 1 | 7 | 30
+
+type ModelUsage = {
+  messages: number
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+  cost: number
+}
+
+type UsageSummary = {
+  sessions: number
+  messages: number
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+  cost: number
+  models: Array<[string, ModelUsage]>
+}
+
+const PERIODS: Array<{ days: Period; label: string }> = [
+  { days: 1, label: "24 h" },
+  { days: 7, label: "7 days" },
+  { days: 30, label: "30 days" },
+]
 
 function formatTokens(value: number) {
-  return Math.round(value).toLocaleString()
+  const units = ["", "K", "M", "G"]
+  let amount = Math.round(value)
+  let unit = 0
+  while (Math.abs(amount) >= 1000 && unit < units.length - 1) {
+    amount /= 1000
+    unit++
+  }
+  // Avoid showing 1000K or 1000M after rounding near a unit boundary.
+  if (Math.abs(Number(amount.toFixed(1))) >= 1000 && unit < units.length - 1) {
+    amount /= 1000
+    unit++
+  }
+  return `${unit === 0 ? amount : Number(amount.toFixed(1))}${units[unit]}`
+}
+
+function formatCost(value: number) {
+  return `$${value.toFixed(2)}`
+}
+
+function emptySummary(): UsageSummary {
+  return { sessions: 0, messages: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, models: [] }
+}
+
+async function fetchUsage(
+  context: any,
+  sessionID: string,
+  scope: Scope,
+  period: Period,
+  progress: (message: string) => void,
+): Promise<UsageSummary> {
+  const activeSession = context.data.session.get(sessionID) ?? await context.client.session.get({ sessionID })
+  if (scope === "project" && !activeSession?.projectID) {
+    throw new Error("Could not identify the current project.")
+  }
+
+  const sessions: any[] = []
+  let sessionCursor: string | undefined
+  const sessionQuery: Record<string, unknown> = scope === "project" ? { project: activeSession.projectID } : {}
+
+  do {
+    const page = await context.client.session.list({ ...sessionQuery, limit: 100, order: "desc", cursor: sessionCursor })
+    sessions.push(...(page.data ?? []))
+    sessionCursor = page.cursor?.next ?? undefined
+    progress(`Fetching sessions… ${sessions.length}`)
+  } while (sessionCursor)
+
+  const cutoff = Date.now() - period * 24 * 60 * 60 * 1000
+  const eligible = sessions.filter((session) => (session.time?.updated ?? 0) >= cutoff)
+  const models = new Map<string, ModelUsage>()
+  let completed = 0
+  let qualifyingSessions = 0
+  let qualifyingMessages = 0
+  let totalCost = 0
+  let totalInput = 0
+  let totalOutput = 0
+  let totalCacheRead = 0
+  let totalCacheWrite = 0
+  let nextSession = 0
+
+  progress(`Summing messages… 0/${eligible.length}`)
+
+  const worker = async () => {
+    while (true) {
+      const index = nextSession++
+      if (index >= eligible.length) return
+
+      const session = eligible[index]
+      let cursor: string | undefined
+      let sessionHadUsage = false
+
+      do {
+        const page = await context.client.message.list({ sessionID: session.id, type: "assistant", limit: 100, cursor })
+        for (const message of page.data ?? []) {
+          if (message.type !== "assistant" || (message.time?.created ?? 0) < cutoff || !message.tokens) continue
+
+          const key = `${message.model?.providerID ?? "unknown"}/${message.model?.id ?? message.model?.modelID ?? "unknown"}`
+          const usage = models.get(key) ?? { messages: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
+          const input = message.tokens.input ?? 0
+          const output = (message.tokens.output ?? 0) + (message.tokens.reasoning ?? 0)
+          const cacheRead = message.tokens.cache?.read ?? 0
+          const cacheWrite = message.tokens.cache?.write ?? 0
+          const cost = message.cost ?? 0
+
+          usage.messages++
+          usage.input += input
+          usage.output += output
+          usage.cacheRead += cacheRead
+          usage.cacheWrite += cacheWrite
+          usage.cost += cost
+          models.set(key, usage)
+
+          qualifyingMessages++
+          sessionHadUsage = true
+          totalInput += input
+          totalOutput += output
+          totalCacheRead += cacheRead
+          totalCacheWrite += cacheWrite
+          totalCost += cost
+        }
+
+        cursor = page.cursor?.next ?? undefined
+      } while (cursor)
+
+      if (sessionHadUsage) qualifyingSessions++
+      completed++
+      progress(`Summing messages… ${completed}/${eligible.length}`)
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(6, eligible.length) }, worker))
+
+  return {
+    sessions: qualifyingSessions,
+    messages: qualifyingMessages,
+    input: totalInput,
+    output: totalOutput,
+    cacheRead: totalCacheRead,
+    cacheWrite: totalCacheWrite,
+    cost: totalCost,
+    models: [...models.entries()].sort((a, b) =>
+      b[1].input + b[1].output + b[1].cacheRead + b[1].cacheWrite -
+      (a[1].input + a[1].output + a[1].cacheRead + a[1].cacheWrite),
+    ),
+  }
+}
+
+function UsageDialog(props: { context: any; sessionID: string }) {
+  const dimensions = useTerminalDimensions()
+  // Leave room for the host dialog's outer spacing, including on resize.
+  const dialogHeight = () => Math.max(1, Math.min(32, dimensions().height - 6))
+  const [scope, setScope] = createSignal<Scope>("project")
+  const [period, setPeriod] = createSignal<Period>(1)
+  const [loading, setLoading] = createSignal(true)
+  const [progress, setProgress] = createSignal("Preparing…")
+  const [error, setError] = createSignal("")
+  const [summary, setSummary] = createSignal<UsageSummary>(emptySummary())
+  const [revision, refresh] = createSignal(0)
+  let generation = 0
+
+  createEffect(() => {
+    revision()
+    const currentGeneration = ++generation
+    const selectedScope = scope()
+    const selectedPeriod = period()
+    setLoading(true)
+    setError("")
+    setProgress("Preparing…")
+
+    void fetchUsage(props.context, props.sessionID, selectedScope, selectedPeriod, (message) => {
+      if (currentGeneration === generation) setProgress(message)
+    })
+      .then((result) => {
+        if (currentGeneration === generation) setSummary(result)
+      })
+      .catch((cause) => {
+        if (currentGeneration === generation) setError(cause instanceof Error ? cause.message : String(cause))
+      })
+      .finally(() => {
+        if (currentGeneration === generation) setLoading(false)
+      })
+  })
+
+  onCleanup(() => { generation++ })
+
+  const theme = () => props.context.theme
+  const muted = () => theme().text.muted ?? theme().text.base
+  const border = () => theme().border?.base ?? muted()
+  const totalInput = () => summary().input + summary().cacheRead + summary().cacheWrite
+  const cacheHit = () => {
+    const input = summary().input + summary().cacheRead + summary().cacheWrite
+    return input > 0 ? `${Math.round((summary().cacheRead / input) * 100)}%` : "—"
+  }
+  const table = createMemo(() => {
+    const headers = ["Provider / Model", "IN", "OUT", "CH", "Cost (USD)", "Messages"]
+    const rows = summary().models.map(([model, usage]) => {
+      const input = usage.input + usage.cacheRead + usage.cacheWrite
+      return [
+        model,
+        formatTokens(input),
+        formatTokens(usage.output),
+        input > 0 ? `${Math.round((usage.cacheRead / input) * 100)}%` : "—",
+        formatCost(usage.cost),
+        usage.messages.toLocaleString("en-US"),
+      ]
+    })
+    const total = ["Total", formatTokens(totalInput()), formatTokens(summary().output), cacheHit(), formatCost(summary().cost), summary().messages.toLocaleString("en-US")]
+    const widths = headers.map((header, index) =>
+      rows.reduce((width, row) => Math.max(width, row[index].length), Math.max(header.length, total[index].length)),
+    )
+    const formatRow = (cells: string[]) => cells.map((cell, index) =>
+      index === 0 ? cell.padEnd(widths[index]) : cell.padStart(widths[index]),
+    ).join("  ")
+    const header = formatRow(headers)
+    return { header, separator: widths.map((width) => "─".repeat(width)).join("  "), rows: rows.map(formatRow), total: formatRow(total), width: header.length }
+  })
+
+  return (
+    <box flexDirection="column" height={dialogHeight()} paddingX={2} paddingY={dimensions().height < 12 ? 0 : 1}>
+      <box flexDirection="row" justifyContent="space-between" gap={2} flexShrink={0}>
+        <text fg={theme().text.base}><b>Tokens usage breakdown</b></text>
+        <text fg={muted()} onMouseDown={() => props.context.ui.dialog.clear()}>esc close</text>
+      </box>
+      <scrollbox flexGrow={1} minHeight={0} scrollX focused contentOptions={{ flexDirection: "column", flexShrink: 0 }}>
+      <box flexDirection="row" flexWrap="wrap" gap={2} paddingTop={1} flexShrink={0}>
+        <text fg={muted()} width={7}>Scope</text>
+        <text
+          fg={scope() === "project" ? theme().primary : muted()}
+          onMouseDown={() => setScope("project")}
+        >
+          {scope() === "project" ? "[ Current project ]" : "  Current project  "}
+        </text>
+        <text
+          fg={scope() === "all" ? theme().primary : muted()}
+          onMouseDown={() => setScope("all")}
+        >
+          {scope() === "all" ? "[ All projects ]" : "  All projects  "}
+        </text>
+      </box>
+      <box flexDirection="row" flexWrap="wrap" gap={2} paddingTop={1} flexShrink={0}>
+        <text fg={muted()} width={7}>Period</text>
+        <For each={PERIODS}>
+          {(item) => (
+            <text fg={period() === item.days ? theme().primary : muted()} onMouseDown={() => setPeriod(item.days)}>
+              {period() === item.days ? `[ ${item.label} ]` : `  ${item.label}  `}
+            </text>
+          )}
+        </For>
+      </box>
+
+      <Show when={loading()}>
+        <box flexDirection="column" paddingY={2} flexShrink={0} alignItems="center" gap={1}>
+          <text fg={theme().primary}>Summing token usage…</text>
+          <text fg={muted()}>{progress()}</text>
+          <text fg={muted()}>You can change the scope or period while loading.</text>
+        </box>
+      </Show>
+      <Show when={error()}>
+        <box flexDirection="column" paddingY={2} flexShrink={0} gap={1}>
+          <text fg={theme().error}><b>Could not fetch usage statistics</b></text>
+          <text fg={muted()}>{error()}</text>
+          <text fg={theme().primary} onMouseDown={() => refresh((value) => value + 1)}>Retry</text>
+        </box>
+      </Show>
+      <Show when={!loading() && !error()}>
+        <box flexDirection="column" paddingTop={1} flexShrink={0}>
+          <box flexDirection="row" justifyContent="space-between" flexWrap="wrap" gap={1} paddingTop={1}>
+            <text fg={theme().text.base}><b>Models · {summary().models.length}</b></text>
+            <text fg={muted()}>{summary().sessions} sessions · {summary().messages} messages</text>
+          </box>
+          <Show when={summary().models.length === 0}>
+            <box flexDirection="column" paddingY={2} alignItems="center" gap={1}>
+              <text fg={theme().text.base}>No token usage</text>
+              <text fg={muted()}>Choose a longer period or all projects.</text>
+            </box>
+          </Show>
+          <Show when={summary().models.length > 0}>
+           <box flexDirection="column" paddingTop={1} width={table().width} flexShrink={0}>
+             <text fg={muted()} wrapMode="none" height={1} width={table().width} flexShrink={0}><b>{table().header}</b></text>
+             <text fg={border()} wrapMode="none" height={1} width={table().width} flexShrink={0}>{table().separator}</text>
+             <For each={table().rows}>
+               {(line) => <text fg={theme().text.base} wrapMode="none" height={1} width={table().width} flexShrink={0}>{line}</text>}
+              </For>
+              <text fg={border()} wrapMode="none" height={1} width={table().width} flexShrink={0}>{table().separator}</text>
+              <text fg={theme().primary} wrapMode="none" height={1} width={table().width} flexShrink={0}><b>{table().total}</b></text>
+          </box>
+          </Show>
+        </box>
+      </Show>
+       <box flexDirection="column" marginTop={1} flexShrink={0}>
+         <text fg={muted()}>IN includes cache · OUT includes reasoning</text>
+       </box>
+      </scrollbox>
+      <box flexDirection="row" justifyContent="space-between" gap={1} flexShrink={0}>
+        <text fg={muted()}>↑↓ / ←→ scroll</text>
+        <text fg={theme().primary} onMouseDown={() => refresh((value) => value + 1)}>Refresh</text>
+      </box>
+    </box>
+  )
+}
+
+function showUsageDialog(context: any, sessionID: string) {
+  context.ui.dialog.show(() => <UsageDialog context={context} sessionID={sessionID} />)
+  context.ui.dialog.set({ size: "large", centered: true })
 }
 
 function TokenStatus(props: { context: any; sessionID?: string }) {
@@ -45,19 +358,47 @@ function TokenStatus(props: { context: any; sessionID?: string }) {
     if (totalInput + output === 0) return
 
     const cacheHit = totalInput > 0 ? `${Math.round((cacheRead / totalInput) * 100)}%` : "—"
-
     return `IN ${formatTokens(totalInput)} · OUT ${formatTokens(output)} · CH ${cacheHit}`
   }
 
-  return <text fg={props.context.theme.text.base}>{label()}</text>
+  const open = (event: MouseEvent) => {
+    if (event.button !== 0 || !props.sessionID) return
+    // Open after release so the initiating click cannot dismiss the new overlay.
+    event.stopPropagation()
+    event.preventDefault()
+    showUsageDialog(props.context, props.sessionID)
+  }
+
+  return <text fg={props.context.theme.text.base} onMouseUp={open}>{label()}</text>
 }
 
 export default Plugin.define({
   id: "opencodelog.tokenstat",
   setup(context) {
+    context.keymap.layer(() => ({
+      commands: [
+        {
+          id: "opencodelog.tokenstat.show",
+          title: "Tokenstat: Show token usage",
+          description: "View token usage by model for the current project or all projects.",
+          group: "Tokenstat",
+          bind: "<leader>shift+s",
+          palette: true,
+          slash: { name: "tokenstat" },
+          enabled: () => context.ui.router.current().type === "session",
+          run: () => {
+            const route = context.ui.router.current()
+            if (route.type !== "session") return
+            showUsageDialog(context, route.sessionID)
+          },
+        },
+      ],
+      bindings: ["opencodelog.tokenstat.show"],
+    }))
+
     return context.ui.slot({
       append: "prompt.footer.status",
-      render: (props) => <TokenStatus context={context} sessionID={props.sessionID ?? props.session_id} />,
+      render: (props) => <TokenStatus context={context} sessionID={props.sessionID ?? (props as any).session_id} />,
     })
   },
 })
