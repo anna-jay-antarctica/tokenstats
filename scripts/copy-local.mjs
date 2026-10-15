@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path"
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 const destination = join(root, ".opencode", "plugins", "tokenstat")
-const files = ["index.ts", "tui.tsx", "package.json"]
+const files = ["index.ts", "tui.tsx", "usage.ts", "package.json"]
 
 await mkdir(destination, { recursive: true })
 await Promise.all(files.map((file) => copyFile(join(root, file), join(destination, file))))

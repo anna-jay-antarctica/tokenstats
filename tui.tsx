@@ -3,34 +3,15 @@ import { Plugin } from "@opencode/plugin/tui"
 import type { MouseEvent } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, For, on, onCleanup, Show } from "solid-js"
+import { emptySummary, fetchUsage, type UsagePeriod, type UsageSummary } from "./usage.ts"
 
 type Scope = "project" | "all"
-type Period = 1 | 7 | 30
 
-type ModelUsage = {
-  messages: number
-  input: number
-  output: number
-  cacheRead: number
-  cacheWrite: number
-  cost: number
-}
-
-type UsageSummary = {
-  sessions: number
-  messages: number
-  input: number
-  output: number
-  cacheRead: number
-  cacheWrite: number
-  cost: number
-  models: Array<[string, ModelUsage]>
-}
-
-const PERIODS: Array<{ days: Period; label: string }> = [
-  { days: 1, label: "24 h" },
-  { days: 7, label: "7 days" },
-  { days: 30, label: "30 days" },
+const PERIODS: Array<{ value: UsagePeriod; label: string }> = [
+  { value: 1, label: "24 h" },
+  { value: 7, label: "7 days" },
+  { value: 30, label: "30 days" },
+  { value: "month", label: "Current month" },
 ]
 
 function formatTokens(value: number) {
@@ -53,148 +34,48 @@ function formatCost(value: number) {
   return `$${value.toFixed(2)}`
 }
 
-function emptySummary(): UsageSummary {
-  return { sessions: 0, messages: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, models: [] }
-}
-
-async function fetchUsage(
-  context: any,
-  sessionID: string,
-  scope: Scope,
-  period: Period,
-  progress: (message: string) => void,
-): Promise<UsageSummary> {
-  const activeSession = context.data.session.get(sessionID) ?? await context.client.session.get({ sessionID })
-  if (scope === "project" && !activeSession?.projectID) {
-    throw new Error("Could not identify the current project.")
-  }
-
-  const sessions: any[] = []
-  let sessionCursor: string | undefined
-  const sessionQuery: Record<string, unknown> = scope === "project" ? { project: activeSession.projectID } : {}
-
-  do {
-    const page = await context.client.session.list({ ...sessionQuery, limit: 100, order: "desc", cursor: sessionCursor })
-    sessions.push(...(page.data ?? []))
-    sessionCursor = page.cursor?.next ?? undefined
-    progress(`Fetching sessions… ${sessions.length}`)
-  } while (sessionCursor)
-
-  const cutoff = Date.now() - period * 24 * 60 * 60 * 1000
-  const eligible = sessions.filter((session) => (session.time?.updated ?? 0) >= cutoff)
-  const models = new Map<string, ModelUsage>()
-  let completed = 0
-  let qualifyingSessions = 0
-  let qualifyingMessages = 0
-  let totalCost = 0
-  let totalInput = 0
-  let totalOutput = 0
-  let totalCacheRead = 0
-  let totalCacheWrite = 0
-  let nextSession = 0
-
-  progress(`Summing messages… 0/${eligible.length}`)
-
-  const worker = async () => {
-    while (true) {
-      const index = nextSession++
-      if (index >= eligible.length) return
-
-      const session = eligible[index]
-      let cursor: string | undefined
-      let sessionHadUsage = false
-
-      do {
-        const page = await context.client.message.list({ sessionID: session.id, type: "assistant", limit: 100, cursor })
-        for (const message of page.data ?? []) {
-          if (message.type !== "assistant" || (message.time?.created ?? 0) < cutoff || !message.tokens) continue
-
-          const key = `${message.model?.providerID ?? "unknown"}/${message.model?.id ?? message.model?.modelID ?? "unknown"}`
-          const usage = models.get(key) ?? { messages: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
-          const input = message.tokens.input ?? 0
-          const output = (message.tokens.output ?? 0) + (message.tokens.reasoning ?? 0)
-          const cacheRead = message.tokens.cache?.read ?? 0
-          const cacheWrite = message.tokens.cache?.write ?? 0
-          const cost = message.cost ?? 0
-
-          usage.messages++
-          usage.input += input
-          usage.output += output
-          usage.cacheRead += cacheRead
-          usage.cacheWrite += cacheWrite
-          usage.cost += cost
-          models.set(key, usage)
-
-          qualifyingMessages++
-          sessionHadUsage = true
-          totalInput += input
-          totalOutput += output
-          totalCacheRead += cacheRead
-          totalCacheWrite += cacheWrite
-          totalCost += cost
-        }
-
-        cursor = page.cursor?.next ?? undefined
-      } while (cursor)
-
-      if (sessionHadUsage) qualifyingSessions++
-      completed++
-      progress(`Summing messages… ${completed}/${eligible.length}`)
-    }
-  }
-
-  await Promise.all(Array.from({ length: Math.min(6, eligible.length) }, worker))
-
-  return {
-    sessions: qualifyingSessions,
-    messages: qualifyingMessages,
-    input: totalInput,
-    output: totalOutput,
-    cacheRead: totalCacheRead,
-    cacheWrite: totalCacheWrite,
-    cost: totalCost,
-    models: [...models.entries()].sort((a, b) =>
-      b[1].input + b[1].output + b[1].cacheRead + b[1].cacheWrite -
-      (a[1].input + a[1].output + a[1].cacheRead + a[1].cacheWrite),
-    ),
-  }
-}
-
 function UsageDialog(props: { context: any; sessionID: string }) {
   const dimensions = useTerminalDimensions()
   // Leave room for the host dialog's outer spacing, including on resize.
   const dialogHeight = () => Math.max(1, Math.min(32, dimensions().height - 6))
   const [scope, setScope] = createSignal<Scope>("project")
-  const [period, setPeriod] = createSignal<Period>(1)
+  const [period, setPeriod] = createSignal<UsagePeriod>(1)
   const [loading, setLoading] = createSignal(true)
   const [progress, setProgress] = createSignal("Preparing…")
   const [error, setError] = createSignal("")
   const [summary, setSummary] = createSignal<UsageSummary>(emptySummary())
-  const [revision, refresh] = createSignal(0)
+  const [reload, setReload] = createSignal({ revision: 0, force: false })
+  const refresh = (force: boolean) => setReload((value) => ({ revision: value.revision + 1, force }))
   let generation = 0
 
-  createEffect(() => {
-    revision()
+  createEffect(on(() => [scope(), period(), reload()] as const, ([selectedScope, selectedPeriod, request], previous) => {
     const currentGeneration = ++generation
-    const selectedScope = scope()
-    const selectedPeriod = period()
+    const controller = new AbortController()
+    onCleanup(() => controller.abort(new Error("Usage request cancelled.")))
     setLoading(true)
     setError("")
+    if (!previous || previous[0] !== selectedScope || previous[1] !== selectedPeriod) setSummary(emptySummary())
     setProgress("Preparing…")
 
     void fetchUsage(props.context, props.sessionID, selectedScope, selectedPeriod, (message) => {
       if (currentGeneration === generation) setProgress(message)
-    })
+    }, controller.signal, (result) => {
+      if (currentGeneration === generation) setSummary(result)
+    }, { force: !!previous && previous[2] !== request && request.force })
       .then((result) => {
-        if (currentGeneration === generation) setSummary(result)
+        if (currentGeneration === generation) {
+          setSummary(result)
+          setError(result.errors.join("\n"))
+        }
       })
       .catch((cause) => {
         if (currentGeneration === generation) setError(cause instanceof Error ? cause.message : String(cause))
+        controller.abort(cause)
       })
       .finally(() => {
         if (currentGeneration === generation) setLoading(false)
       })
-  })
+  }))
 
   onCleanup(() => { generation++ })
 
@@ -207,7 +88,7 @@ function UsageDialog(props: { context: any; sessionID: string }) {
     return input > 0 ? `${Math.round((summary().cacheRead / input) * 100)}%` : "—"
   }
   const table = createMemo(() => {
-    const headers = ["Provider / Model", "IN", "OUT", "CH", "Cost (USD)", "Messages"]
+    const headers = ["Provider / Model", "IN", "OUT", "CH", "Cost (USD)", "Steps"]
     const rows = summary().models.map(([model, usage]) => {
       const input = usage.input + usage.cacheRead + usage.cacheWrite
       return [
@@ -216,10 +97,10 @@ function UsageDialog(props: { context: any; sessionID: string }) {
         formatTokens(usage.output),
         input > 0 ? `${Math.round((usage.cacheRead / input) * 100)}%` : "—",
         formatCost(usage.cost),
-        usage.messages.toLocaleString("en-US"),
+        usage.steps.toLocaleString("en-US"),
       ]
     })
-    const total = ["Total", formatTokens(totalInput()), formatTokens(summary().output), cacheHit(), formatCost(summary().cost), summary().messages.toLocaleString("en-US")]
+    const total = [summary().completedDays < summary().totalDays ? "Partial total" : "Total", formatTokens(totalInput()), formatTokens(summary().output), cacheHit(), formatCost(summary().cost), summary().steps.toLocaleString("en-US")]
     const widths = headers.map((header, index) =>
       rows.reduce((width, row) => Math.max(width, row[index].length), Math.max(header.length, total[index].length)),
     )
@@ -256,8 +137,8 @@ function UsageDialog(props: { context: any; sessionID: string }) {
         <text fg={muted()} width={7}>Period</text>
         <For each={PERIODS}>
           {(item) => (
-            <text fg={period() === item.days ? theme().primary : muted()} onMouseDown={() => setPeriod(item.days)}>
-              {period() === item.days ? `[ ${item.label} ]` : `  ${item.label}  `}
+            <text fg={period() === item.value ? theme().primary : muted()} onMouseDown={() => setPeriod(item.value)}>
+              {period() === item.value ? `[ ${item.label} ]` : `  ${item.label}  `}
             </text>
           )}
         </For>
@@ -265,27 +146,28 @@ function UsageDialog(props: { context: any; sessionID: string }) {
 
       <Show when={loading()}>
         <box flexDirection="column" paddingY={2} flexShrink={0} alignItems="center" gap={1}>
-          <text fg={theme().primary}>Summing token usage…</text>
+          <text fg={theme().primary}>Loading daily token usage…</text>
           <text fg={muted()}>{progress()}</text>
           <text fg={muted()}>You can change the scope or period while loading.</text>
         </box>
       </Show>
       <Show when={error()}>
         <box flexDirection="column" paddingY={2} flexShrink={0} gap={1}>
-          <text fg={theme().error}><b>Could not fetch usage statistics</b></text>
+          <text fg={theme().error}><b>{summary().totalDays > 0 ? "Incomplete usage statistics" : "Could not fetch usage statistics"}</b></text>
           <text fg={muted()}>{error()}</text>
-          <text fg={theme().primary} onMouseDown={() => refresh((value) => value + 1)}>Retry</text>
+          <text fg={theme().primary} onMouseDown={() => refresh(false)}>Retry missing days</text>
         </box>
       </Show>
-      <Show when={!loading() && !error()}>
+      <Show when={summary().completedDays > 0 || (!loading() && !error())}>
         <box flexDirection="column" paddingTop={1} flexShrink={0}>
           <box flexDirection="row" justifyContent="space-between" flexWrap="wrap" gap={1} paddingTop={1}>
             <text fg={theme().text.base}><b>Models · {summary().models.length}</b></text>
-            <text fg={muted()}>{summary().sessions} sessions · {summary().messages} messages</text>
+            <text fg={muted()}>{summary().sessions !== undefined ? `${summary().sessions} sessions · ` : ""}{summary().steps} steps</text>
           </box>
+          <text fg={muted()}>{summary().completedDays}/{summary().totalDays} day slices · {summary().cacheHits} cached · As of {new Date(summary().asOf).toLocaleString("en-US")}</text>
           <Show when={summary().models.length === 0}>
             <box flexDirection="column" paddingY={2} alignItems="center" gap={1}>
-              <text fg={theme().text.base}>No token usage</text>
+              <text fg={theme().text.base}>{summary().completedDays < summary().totalDays ? "No token usage in the loaded days" : "No token usage"}</text>
               <text fg={muted()}>Choose a longer period or all projects.</text>
             </box>
           </Show>
@@ -308,7 +190,7 @@ function UsageDialog(props: { context: any; sessionID: string }) {
       </scrollbox>
       <box flexDirection="row" justifyContent="space-between" gap={1} flexShrink={0}>
         <text fg={muted()}>↑↓ / ←→ scroll</text>
-        <text fg={theme().primary} onMouseDown={() => refresh((value) => value + 1)}>Refresh</text>
+        <text fg={theme().primary} onMouseDown={() => refresh(true)}>Refresh</text>
       </box>
     </box>
   )
